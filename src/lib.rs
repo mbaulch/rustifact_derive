@@ -6,6 +6,7 @@
 //!
 //! This crate serves to provide a derive macro for the `rustifact::ToTokenStream` trait. You should not need
 //! to use this crate directly, as it's exposed via the `rustifact` crate.
+
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
@@ -13,7 +14,7 @@ use syn::{
     Ident, Index,
 };
 
-fn get_struct_body(name: &Ident, data: &DataStruct) -> TokenStream {
+fn get_struct_body(out_type: &Ident, data: &DataStruct) -> TokenStream {
     match &data.fields {
         Fields::Named(FieldsNamed { named, .. }) => {
             let mut init_toks = TokenStream::new();
@@ -26,7 +27,7 @@ fn get_struct_body(name: &Ident, data: &DataStruct) -> TokenStream {
             quote! {
                 #init_toks
                 let element = rustifact::internal::quote! {
-                    #name {
+                    #out_type {
                         #fields
                     }
                 };
@@ -38,14 +39,14 @@ fn get_struct_body(name: &Ident, data: &DataStruct) -> TokenStream {
             let mut fields = TokenStream::new();
             for i in 0..unnamed.len() {
                 let index = Index::from(i);
-                let ident = Ident::new(&format!("ident{}", i), name.span());
+                let ident = Ident::new(&format!("ident{}", i), out_type.span());
                 init_toks.extend(quote! { let #ident = self.#index.to_tok_stream(); });
                 fields.extend(quote! { ##ident, });
             }
             quote! {
                 #init_toks
                 let element = rustifact::internal::quote! {
-                    #name ( #fields )
+                    #out_type ( #fields )
                 };
                 toks.extend(element);
             }
@@ -56,7 +57,7 @@ fn get_struct_body(name: &Ident, data: &DataStruct) -> TokenStream {
     }
 }
 
-fn get_enum_body(name: &Ident, data: &DataEnum) -> TokenStream {
+fn get_enum_body(out_type: &Ident, data: &DataEnum) -> TokenStream {
     let mut arms = TokenStream::new();
     for v in &data.variants {
         let ident = &v.ident;
@@ -66,21 +67,21 @@ fn get_enum_body(name: &Ident, data: &DataEnum) -> TokenStream {
                 let mut fields = TokenStream::new();
                 let mut fields_out = TokenStream::new();
                 for i in 0..fields_unnamed.unnamed.len() {
-                    let id = Ident::new(&format!("ident{}", i), name.span());
-                    let id_toks = Ident::new(&format!("ident{}_toks", i), name.span());
+                    let id = Ident::new(&format!("ident{}", i), out_type.span());
+                    let id_toks = Ident::new(&format!("ident{}_toks", i), out_type.span());
                     init_toks.extend(quote! { let #id_toks = #id.to_tok_stream(); });
                     fields.extend(quote! { #id, });
                     fields_out.extend(quote! { ##id_toks, });
                 }
                 if fields.is_empty() {
                     quote! {
-                        #name::#ident => rustifact::internal::quote! { #name::#ident },
+                        #out_type::#ident => rustifact::internal::quote! { #out_type::#ident },
                     }
                 } else {
                     quote! {
-                        #name::#ident( #fields ) => {
+                        #out_type::#ident( #fields ) => {
                             #init_toks
-                            rustifact::internal::quote! { #name::#ident( #fields_out ) }
+                            rustifact::internal::quote! { #out_type::#ident( #fields_out ) }
                         },
                     }
                 }
@@ -89,7 +90,7 @@ fn get_enum_body(name: &Ident, data: &DataEnum) -> TokenStream {
                 panic!("Named fields are not yet supported");
             }
             Fields::Unit => {
-                quote! { #name::#ident => rustifact::internal::quote! { #name::#ident }, }
+                quote! { #out_type::#ident => rustifact::internal::quote! { #out_type::#ident }, }
             }
         };
         arms.extend(toks);
@@ -102,13 +103,57 @@ fn get_enum_body(name: &Ident, data: &DataEnum) -> TokenStream {
     }
 }
 
-#[proc_macro_derive(ToTokenStream)]
+/// Implement `ToTokenStream` for a struct or enum with components implementating `ToTokenStream`.
+///
+/// # Basic usage
+/// ```no_run
+/// use rustifact::ToTokenStream;
+///
+/// #[derive(ToTokenStream)]
+/// pub struct MyStruct {
+///     // fields...
+/// }
+///
+/// #[derive(ToTokenStream)]
+/// pub enum MyEnum {
+///     // variants...
+/// }
+/// ````
+///
+/// # Type mapping
+/// In the case that some components change type under ToTokenStream, like for example String which is
+/// mapped to &'static str, a separate output type may be specified with the OutType attribute.
+///
+/// #
+/// ```no_run
+/// use rustifact::ToTokenStream;
+///
+/// pub struct StructWithStr {
+///     pub s: &'static str,
+/// }
+///
+/// #[derive(ToTokenStream)]
+/// #[OutType(StructWithStr)]
+/// pub struct StructWithStrIn {
+///     pub s: String,
+/// }
+/// ````
+#[proc_macro_derive(ToTokenStream, attributes(OutType))]
 pub fn derive_token_stream(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
-    let name = &ast.ident;
+    let in_type = &ast.ident;
+    let mut out_type: Ident = in_type.clone();
+
+    for attr in &ast.attrs {
+        if attr.path().is_ident("OutType") {
+            if let Ok(id) = attr.parse_args::<Ident>() {
+                out_type = id;
+            }
+        }
+    }
     let body = match &ast.data {
-        Data::Struct(data) => get_struct_body(name, data),
-        Data::Enum(data) => get_enum_body(name, data),
+        Data::Struct(data) => get_struct_body(&out_type, data),
+        Data::Enum(data) => get_enum_body(&out_type, data),
         Data::Union(_) => {
             panic!("Unions are not yet supported");
         }
@@ -116,7 +161,7 @@ pub fn derive_token_stream(input: proc_macro::TokenStream) -> proc_macro::TokenS
     let generics = &ast.generics;
     let gen_where = &generics.where_clause;
     quote! {
-        impl #generics rustifact::ToTokenStream for #name #generics #gen_where {
+        impl #generics rustifact::ToTokenStream for #in_type #generics #gen_where {
             fn to_toks(&self, toks: &mut rustifact::internal::TokenStream) {
                 #body
             }
